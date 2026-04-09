@@ -95,6 +95,54 @@ static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val) {
     return 0;
 }
 
+static int motion_burst_read(const struct device *dev, uint8_t *buf, size_t burst_size) {
+    int err;
+    /* struct pixart_data *data = dev->data; */
+    const struct pixart_config *config = dev->config;
+
+    __ASSERT_NO_MSG(burst_size <= PMW3610_MAX_BURST_SIZE);
+
+    err = spi_cs_ctrl(dev, true);
+    if (err) {
+        return err;
+    }
+
+    /* Send motion burst address */
+    uint8_t reg_buf[] = {PMW3610_REG_MOTION_BURST};
+    const struct spi_buf tx_buf = {.buf = reg_buf, .len = ARRAY_SIZE(reg_buf)};
+    const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
+
+    err = spi_write_dt(&config->bus, &tx);
+    if (err) {
+        LOG_ERR("Motion burst failed on SPI write");
+        return err;
+    }
+
+    k_busy_wait(T_SRAD_MOTBR);
+
+    const struct spi_buf rx_buf = {
+        .buf = buf,
+        .len = burst_size,
+    };
+    const struct spi_buf_set rx = {.buffers = &rx_buf, .count = 1};
+
+    err = spi_read_dt(&config->bus, &rx);
+    if (err) {
+        LOG_ERR("Motion burst failed on SPI read");
+        return err;
+    }
+
+    err = spi_cs_ctrl(dev, false);
+    if (err) {
+        return err;
+    }
+
+    /* Terminate burst */
+    k_busy_wait(T_BEXIT);
+
+    return 0;
+}
+
 static int pmw3610_set_cpi(const struct device *dev, uint32_t cpi, 
                            bool swap_xy, bool inv_x, bool inv_y) {
     /* Set resolution with CPI step of 200 cpi
