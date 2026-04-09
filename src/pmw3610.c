@@ -296,7 +296,7 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
 static int pmw3610_set_interrupt(const struct device *dev, const bool en) {
     const struct pixart_config *config = dev->config;
     int ret = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
-                                              en ? GPIO_INT_LEVEL_ACTIVE : GPIO_INT_DISABLE);
+                                              en ? GPIO_INT_EDGE_TO_ACTIVE : GPIO_INT_DISABLE);
     if (ret < 0) {
         LOG_ERR("can't set interrupt");
     }
@@ -415,6 +415,10 @@ static void pmw3610_async_init(struct k_work *work) {
         if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
             data->ready = true; // sensor is ready to work
             LOG_INF("PMW3610 initialized");
+            // Clear any pending motion data so MOT pin resets to inactive,
+            // ensuring the edge-triggered interrupt can detect the next motion.
+            uint8_t clear_buf[PMW3610_BURST_SIZE];
+            motion_burst_read(dev, clear_buf, sizeof(clear_buf));
             pmw3610_set_interrupt(dev, true);
         } else {
             k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
@@ -662,6 +666,107 @@ static const struct sensor_driver_api pmw3610_driver_api = {
 // }
 // #endif // IS_ENABLED(CONFIG_PM_DEVICE)
 // PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);
+
+#ifdef CONFIG_PMW3610_PM
+static int pmw3610_pm_action(const struct device *dev, enum pm_device_action action) {
+    const struct pixart_config *config = dev->config;
+    struct pixart_data *data = dev->data;
+    int err = 0;
+
+    switch (action) {
+    case PM_DEVICE_ACTION_SUSPEND:
+    case PM_DEVICE_ACTION_TURN_OFF:
+        LOG_INF("PMW3610 turning OFF - releasing all pins to prevent back-feed");
+
+        // Cancel all pending work
+        k_work_cancel_delayable(&data->init_work);
+        k_work_cancel(&data->trigger_work);
+
+        // Remove normal interrupt callback
+        gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_DISABLE);
+        gpio_remove_callback(config->irq_gpio.port, &data->irq_gpio_cb);
+
+        // Clear any pending motion data so MOT pin goes inactive
+        {
+            uint8_t clear_buf[PMW3610_BURST_SIZE];
+            motion_burst_read(dev, clear_buf, sizeof(clear_buf));
+        }
+
+        // Configure IRQ as wake source for System OFF.
+        // GPIO SENSE (level-based) is the only wake mechanism in System OFF.
+        // The sensor stays powered and will assert MOT (low) on ball movement.
+        gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_LEVEL_ACTIVE);
+
+        // Release CS pin to high-Z (input) to prevent back-feeding power
+        err = gpio_pin_configure_dt(&config->cs_gpio, GPIO_INPUT);
+        if (err) {
+            LOG_WRN("Failed to release CS pin: %d", err);
+        }
+
+        // Release SPI data pins to high-Z to prevent back-feeding power through ESD diodes
+        // These pins are defined in the overlay: SCK=P1.13, MOSI/MISO=P0.10
+        {
+            const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+            const struct device *gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+
+            if (device_is_ready(gpio0)) {
+                // MOSI/MISO on P0.10
+                gpio_pin_configure(gpio0, 10, GPIO_DISCONNECTED);
+                LOG_INF("Released P0.10 (MOSI/MISO) to disconnected");
+            }
+            if (device_is_ready(gpio1)) {
+                // SCK on P1.13
+                gpio_pin_configure(gpio1, 13, GPIO_DISCONNECTED);
+                LOG_INF("Released P1.13 (SCK) to disconnected");
+            }
+        }
+
+        // Mark as not ready
+        data->ready = false;
+
+        LOG_INF("PMW3610 fully disabled - all pins released to high-Z");
+        break;
+
+    case PM_DEVICE_ACTION_RESUME:
+    case PM_DEVICE_ACTION_TURN_ON:
+        LOG_INF("PMW3610 turning ON - reconfiguring pins and reinitializing");
+
+        // Reconfigure CS pin as output (inactive/high for active-low CS)
+        err = gpio_pin_configure_dt(&config->cs_gpio, GPIO_OUTPUT_INACTIVE);
+        if (err) {
+            LOG_ERR("Cannot reconfigure CS GPIO: %d", err);
+            return err;
+        }
+
+        // Reconfigure IRQ pin as input with original flags
+        err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
+        if (err) {
+            LOG_ERR("Cannot reconfigure IRQ GPIO: %d", err);
+            return err;
+        }
+
+        // Re-add GPIO callback
+        err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
+        if (err) {
+            LOG_ERR("Cannot re-add IRQ GPIO callback: %d", err);
+            return err;
+        }
+
+        // Full reinitialization from power up
+        data->async_init_step = ASYNC_INIT_STEP_POWER_UP;
+        data->ready = false;
+        k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
+
+        LOG_INF("PMW3610 reinitialization started");
+        break;
+
+    default:
+        return -ENOTSUP;
+    }
+
+    return err;
+}
+#endif /* CONFIG_PMW3610_PM */
 
 #define PMW3610_SPI_MODE (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | \
                         SPI_MODE_CPHA | SPI_TRANSFER_MSB)
