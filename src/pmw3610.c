@@ -667,7 +667,7 @@ static const struct sensor_driver_api pmw3610_driver_api = {
 // #endif // IS_ENABLED(CONFIG_PM_DEVICE)
 // PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);
 
-#ifdef CONFIG_PMW3610_PM
+#ifdef CONFIG_PMW3610_ALT_PM
 static int pmw3610_pm_action(const struct device *dev, enum pm_device_action action) {
     const struct pixart_config *config = dev->config;
     struct pixart_data *data = dev->data;
@@ -766,7 +766,7 @@ static int pmw3610_pm_action(const struct device *dev, enum pm_device_action act
 
     return err;
 }
-#endif /* CONFIG_PMW3610_PM */
+#endif /* CONFIG_PMW3610_ALT_PM */
 
 #define PMW3610_SPI_MODE (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | \
                         SPI_MODE_CPHA | SPI_TRANSFER_MSB)
